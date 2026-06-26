@@ -1,0 +1,18 @@
+{
+  "name": "slack-keep-active",
+  "version": "1.0.0",
+  "description": "Держит ваш Slack-аккаунт в статусе 'active' (зелёный шарик) по расписанию рабочих часов",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "prepare": "git config core.hooksPath .githooks 2>/dev/null || true"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "license": "MIT"
+}

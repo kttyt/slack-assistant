@@ -1,0 +1,17 @@
+services:
+  slack-keep-active:
+    build: .
+    image: slack-keep-active:latest
+    container_name: slack-keep-active
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      # health-эндпоинт наружу: curl http://localhost:3000/health
+      - "127.0.0.1:3000:3000"
+    # Логи можно смотреть: docker compose logs -f
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"

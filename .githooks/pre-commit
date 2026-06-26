@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+#
+# Pre-commit hook: не даёт случайно закоммитить секреты.
+# Активируется автоматически после `npm install` (см. script "prepare" в
+# package.json → git config core.hooksPath .githooks).
+#
+# Два рубежа:
+#   1) запрет секретных файлов по имени (.env, *.pem, *.key, …), даже через `git add -f`;
+#   2) поиск характерных паттернов секретов в добавленных строках (Slack-токены,
+#      приватные ключи, ключи AWS/Google/GitHub).
+#
+# Крайний случай (ложное срабатывание) — обойти: git commit --no-verify
+#
+set -uo pipefail
+
+red()    { printf '\033[31m%s\033[0m\n' "$*"; }
+yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
+
+fail=0
+
+# Staged-файлы (добавленные/изменённые, без удалённых)
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+[ -z "$staged" ] && exit 0
+
+is_template() {
+  case "$1" in
+    *.example|*.sample|*.template|*.dist) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ── Рубеж 1: запрещённые по имени файлы ──────────────────────────────────────
+while IFS= read -r f; do
+  [ -z "$f" ] && continue
+  is_template "$f" && continue
+  case "$f" in
+    .env|.env.*)
+      red "✖ Секретный файл в коммите: $f  (храните секреты вне git, в .env)"; fail=1 ;;
+    *.pem|*.key|*.p12|*.pfx|*.keystore|*.crt|id_rsa|id_dsa|*credentials*.json|*secret*.json|.npmrc)
+      red "✖ Похоже на файл с ключами/кредами: $f"; fail=1 ;;
+  esac
+done <<< "$staged"
+
+# ── Рубеж 2: паттерны секретов в добавленных строках ─────────────────────────
+# Slack web-токен/cookie (xoxc-/xoxd-) и боты (xoxb- и пр.), приватные ключи,
+# AWS Access Key, Google API key, GitHub token.
+patterns='xox[bpasrcd]-[0-9A-Za-z%/_+-]{12,}'
+patterns+='|-----BEGIN [A-Z ]*PRIVATE KEY-----'
+patterns+='|AKIA[0-9A-Z]{16}'
+patterns+='|AIza[0-9A-Za-z_-]{35}'
+patterns+='|gh[pousr]_[0-9A-Za-z]{36}'
+
+while IFS= read -r f; do
+  [ -z "$f" ] && continue
+  is_template "$f" && continue
+  added=$(git diff --cached -U0 -- "$f" | grep -E '^\+' | grep -vE '^\+\+\+' || true)
+  if printf '%s\n' "$added" | grep -EqI "$patterns"; then
+    red "✖ В изменениях файла $f найден фрагмент, похожий на секрет."
+    fail=1
+  fi
+done <<< "$staged"
+
+if [ "$fail" -ne 0 ]; then
+  echo
+  yellow "Коммит остановлен: обнаружены потенциальные секреты."
+  yellow "• Секреты держите в .env (он в .gitignore); в репозиторий — только .env.example с плейсхолдерами."
+  yellow "• Ложное срабатывание? Обойти: git commit --no-verify"
+  exit 1
+fi
+
+exit 0
