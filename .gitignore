@@ -5,6 +5,7 @@
 .env.*
 !.env.example
 *.local
+config.yaml
 
 # Ключи, сертификаты, креды
 *.pem

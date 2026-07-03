@@ -6,9 +6,19 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    # Необязательный YAML-конфиг (несекретные настройки). Секреты остаются в .env выше.
+    # Раскомментируйте volume + command, чтобы использовать config.yaml:
+    volumes:
+      - ./config.yaml:/app/config.yaml
+    command: ["node", "src/index.js", "--config=/app/config.yaml"]
     ports:
-      # health-эндпоинт наружу: curl http://localhost:3000/health
+      # API-эндпоинт наружу: curl http://localhost:3000/health
       - "127.0.0.1:3000:3000"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
     # Логи можно смотреть: docker compose logs -f
     logging:
       driver: json-file

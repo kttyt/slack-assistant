@@ -7,7 +7,8 @@
 
 Небольшой self-hosted сервис, который:
 1. Держит Slack-аккаунт в статусе **active** (🟢 зелёный шарик) по расписанию рабочих часов.
-2. **Уведомляет о входящих** прямых `@`-упоминаниях и личных сообщениях (DM).
+2. **Уведомляет о входящих** — упоминания, DM, групповые DM, ключевые слова.
+3. Отдаёт **управляющий API** (`POST /react/{channel}/{ts}`) для реакции на сообщение из внешних сервисов.
 
 Цель — выглядеть «на связи» в рабочие часы и не пропускать обращения.
 
@@ -19,7 +20,7 @@
   через официальное OAuth-приложение. Это **неофициальный, реверс-инжиниринговый** способ;
   Slack может сломать его в любой момент.
 - Токен/cookie = **полный доступ к аккаунту**. Хранить как пароль, не шарить, не коммитить.
-  Протухают после ре-логина/смены пароля — тогда нужно обновить `.env`.
+  Протухают после ре-логина/смены пароля — тогда обновить `.env` (быстро — `npm run grab-token`).
 
 ## Ключевое техническое решение (почему именно так)
 
@@ -32,9 +33,10 @@
 то же, что браузерный Slack:
 
 1. `rtm.connect` → получает URL WebSocket.
-2. Держит сокет открытым + периодический `ping` → Slack видит активного клиента → 🟢.
+2. Держит сокет открытым + периодический `ping`; heartbeat следит за `pong` (нет ответа дольше
+   `PONG_TIMEOUT_MS` → соединение считается мёртвым → реконнект с backoff).
 3. Периодически подтверждает `presence=auto`, опционально снимает DND (чтобы не было 💤).
-4. По тому же сокету приходят события `message` → детект упоминаний/DM.
+4. По тому же сокету приходят события `message` → детект упоминаний/DM/ключевых слов.
 
 Проверено эмпирически: и Web API, и WebSocket требуют **и** `xoxc`, **и** cookie `d`
 (по отдельности — `invalid_auth`).
@@ -51,88 +53,94 @@
 
 ## Возможности
 
-- **Presence по расписанию** — рабочие дни/часы по таймзоне (`WORK_DAYS`, `WORK_START/END`, `TZ`).
-  Поддерживает окно через полночь. Вне часов — отпускает соединение (естественный серый).
-- **Плавающее расписание** — границы старта/конца каждый день случайно сдвигаются на
-  ±(`JITTER_MIN_MINUTES`..`JITTER_MAX_MINUTES`) минут. Сдвиг детерминирован по дню (стабилен
-  в течение суток, разный день ото дня) — чтобы не включаться ровно по часам как робот.
-- **Healthcheck протухания токена** — периодический `auth.test`; при `invalid_auth`/`token_revoked`/…
-  громкий лог + HTTP `/health` отдаёт 503 + Docker помечает контейнер `unhealthy`.
-- **Мониторинг упоминаний/DM** — на тот же WebSocket: ловит `<@me>` и личные сообщения,
-  резолвит имя отправителя (`users.info`), шлёт `POST` JSON на `WEBHOOK_URL` (или только в лог).
-  Свои сообщения игнорируются (кроме `NOTIFY_SELF=true` для самопроверки).
-  **Важно:** работает только в рабочие часы (когда сокет открыт) и только в реальном времени —
-  историю не читает.
+- **Presence по расписанию** — рабочие дни/часы по таймзоне; окно через полночь; вне часов
+  отпускает соединение (или явный `away` при `OFF_HOURS_MODE=away`).
+- **Плавающее расписание** — границы окна каждый день случайно сдвигаются на
+  ±(`JITTER_MIN`..`JITTER_MAX`) мин; детерминировано по дню (стабильно в течение суток).
+- **Устойчивое соединение** — heartbeat по `pong`, реконнект с экспоненциальным backoff.
+- **Мониторинг входящих** — упоминания (`<@me>` и, опц., `@here`/`@channel`), DM, групповые DM
+  (mpim), ключевые слова. Настраивается тонко. `POST` JSON на `WEBHOOK_URL` или только в лог
+  (в INFO видно `ch=… ts=…`). Работает только в рабочие часы, историю не читает.
+- **Управляющий API `/react`** — `POST /react/{channel}/{ts}` ставит реакцию (`reactions.add`),
+  защищён `CONTROL_TOKEN`. Без состояния.
+- **Healthcheck** — `auth.test` + HTTP `/health` (200 / 503 `token_invalid` / 503 `socket_down`),
+  Docker помечает контейнер `unhealthy`.
+- **Конфиг: ENV и/или YAML** — `--config=config.yaml`; приоритет ENV → YAML → дефолт. Секреты
+  только в ENV.
+- **User-Agent** — мимикрия под браузер (реалистичный дефолт, переопределяется).
+- **HTTP/S-прокси** — весь трафик через прокси (опциональные пакеты `undici`/`https-proxy-agent`).
+- **`grab-token`** — headful-Playwright хелпер снимает токен/cookie/UA из браузера в `.env`.
 
 ## Защита секретов (важно для команды)
 
-В репозитории два уровня защиты от утечки токенов — **ничего секретного в git не попадает**:
+Два уровня защиты — **ничего секретного в git не попадает**:
 
-1. **`.gitignore`** игнорирует `.env`, `.env.*` (кроме `.env.example`), `*.pem`, `*.key`,
-   `.npmrc` и пр.
+1. **`.gitignore`** игнорирует `.env`, `.env.*` (кроме `.env.example`), `config.yaml`, `*.pem`,
+   `*.key`, `.npmrc` и пр.
 2. **pre-commit hook** (`.githooks/pre-commit`) блокирует коммит секретных файлов и строк,
    похожих на токены (`xoxc-`/`xoxd-`, приватные ключи). Активируется автоматически после
    `npm install` (script `prepare` → `git config core.hooksPath .githooks`).
 
-Онбординг нового участника: `git clone` → `npm install` (включит хук) → `cp .env.example .env`
-→ вписать **свои** токены. Меняете набор переменных — обновите `.env.example` (с плейсхолдерами).
-Осознанный обход ложного срабатывания: `git commit --no-verify`.
+Онбординг: `git clone` → `npm install` (включит хук) → `cp .env.example .env` → вписать **свои**
+токены (или `npm run grab-token`). Меняете набор переменных — обновите `.env.example` и/или
+`config.example.yaml`. Осознанный обход ложного срабатывания: `git commit --no-verify`.
 
 ## Архитектура (файлы)
 
+Ядро на инъекции зависимостей: компоненты — фабрики (`createSlackClient`, `createSchedule`,
+`createNotifier`, `createHealth`, `buildProxy`) и класс `PresenceKeeper`; всё передаётся явно.
+Единственное место, читающее env и живущее с `process.exit`, — CLI-точка `index.js`.
+
 ```
-src/index.js       — точка входа: health-сервер + проверка токена + планировщик
-src/connection.js  — WebSocket keep-alive, reconnect, presence/DND, разбор входящих сообщений
-src/slack.js       — Web API (rtm.connect, setPresence, dnd, users.info) на xoxc+d
-src/schedule.js    — рабочие часы по TZ + плавающие (jitter) границы
-src/health.js      — состояние валидности токена + HTTP /health
-src/notifier.js    — доставка уведомлений на webhook
-src/config.js      — чтение/валидация env
-src/logger.js      — логи с уровнями
-Dockerfile, docker-compose.yml, .env.example, README.md
+src/index.js       — CLI: loadConfig → сборка компонентов → HTTP-сервер + проверка токена + планировщик
+src/config.js      — чистая loadConfig(env, yaml): таблица настроек SCHEMA + движок слияния/валидации
+src/config-file.js — чтение config.yaml по флагу --config
+src/connection.js  — PresenceKeeper: WebSocket keep-alive, heartbeat, reconnect, presence/DND, оркестрация
+src/detect.js      — чистая classifyMessage(): решает, уведомлять ли и каким видом
+src/slack.js       — createSlackClient + isAuthError: Web API (rtm.connect, setPresence, dnd, reactions.add, …)
+src/schedule.js    — createSchedule: рабочие часы по TZ + плавающие (jitter) границы
+src/notifier.js    — createNotifier: доставка уведомлений на webhook
+src/health.js      — createHealth: состояние токена/сокета (чистое, без HTTP)
+src/proxy.js       — buildProxy: HTTP/S-прокси для fetch/ws (опциональные пакеты)
+src/logger.js      — логи с уровнями (+ setLevel из конфига)
+src/server/        — HTTP-сервер: index.js (startServer+router), router.js, http-util.js, handlers/{health,react}.js
+tools/grab-token.js — headful-Playwright: снять токен из браузера
+test/              — vitest: unit / module / integration + управляемый фейковый Slack-сервер
+Dockerfile · docker-compose.yml · .env.example · config.example.yaml · README.md · CLAUDE.md
 ```
 
 ## Конфигурация
 
-Полный список переменных — в `.env.example` и таблице в `README.md`. Главное:
-`SLACK_XOXC_TOKEN`, `SLACK_XOXD_COOKIE` (обязательны), `TZ`, `WORK_DAYS`, `WORK_START/END`,
-`WEBHOOK_URL`, `CLEAR_DND`. Получение токенов — раздел «Получение токенов» в `README.md`.
+Источники: **ENV → config.yaml (`--config`) → дефолт**. Полный список — в `.env.example`,
+`config.example.yaml` и таблицах в `README.md`. Обязательны (только ENV): `SLACK_XOXC_TOKEN`,
+`SLACK_XOXD_COOKIE`. Часто задают: `TZ`, `WORK_DAYS`, `WORK_START/END`, `WEBHOOK_URL`,
+`OFF_HOURS_MODE`, `CLEAR_DND`, `CONTROL_TOKEN` (для `/react`).
 
-## Запуск
+## Запуск и разработка
 
-**Docker (рекомендуется для 24/7, есть авто-рестарт и healthcheck):**
+**Docker (рекомендуется для 24/7):**
 ```bash
 cp .env.example .env   # заполнить токены и расписание
 docker compose up -d --build
-docker compose logs -f
+docker compose logs -f          # НЕ через `docker compose run` — он дублирует вывод в TTY
 ```
 
-**Локально через Node (fallback, если Docker недоступен):**
-```bash
-node --env-file=.env src/index.js
-```
+**Локально:** `node --env-file=.env src/index.js [--config=config.yaml]`.
 
-## Текущее состояние (на момент написания)
+**Тесты/линт:** `npm test` (vitest), `npm run lint` (ESLint).
 
-- Сервис собран, протестирован end-to-end, **запущен и работает**.
-- Авторизован как **@vcherkasov / BHFT** (user_id `U065FJ9GBFV`).
-- Запущен **локально через Node**, т.к. на машине **Docker Desktop подвис** (демон не отвечал;
-  мягкий и жёсткий перезапуск не помогли — вероятно, требует ручного действия в GUI).
-- `WEBHOOK_URL` пока не задан → уведомления идут только в лог (`/tmp/skac_node.log`).
+## Состояние
 
-### Проверено живьём
-- Presence: `rtm.connect` → WebSocket → `hello` → 🟢.
-- Healthcheck: с фейковым токеном → 503 + предупреждение; с валидным → `healthy`.
-- Плавающее окно: границы разные по дням, детерминированы в течение суток.
-- Мониторинг: упоминание поймано, имя отправителя резолвится, уведомление сформировано.
+- Сервис собран, покрыт тестами (unit/module/integration, ~100+ кейсов), запускается в Docker и
+  локально. Логика детекта и конфиг — чистые функции с тестами; сеть/сокеты — интеграционные тесты
+  против фейкового Slack.
 
 ## Открытые вопросы / TODO
 
-- [ ] Задать `WEBHOOK_URL` (Discord/Telegram-релей/n8n/свой сервер; для теста — webhook.site).
-- [ ] Решить, нужен ли **мониторинг 24/7** (сейчас только в рабочие часы). Для 24/7 надо
-      развязать WebSocket и presence: сокет держать всегда, 🟢/⚪️ регулировать через `setPresence`.
-- [ ] Постоянный автозапуск без Docker — оформить `launchd`-агент (старт при логине + рестарт
-      при падении). Либо вернуться в Docker, когда оживёт демон.
-- [ ] Опционально: отдельный персистентный журнал упоминаний (`mentions.jsonl` в volume).
-- [ ] Безопасность: токен `xoxc` ранее светился в переписке — при ужесточении требований
-      перелогиниться в браузерном Slack (инвалидирует старую сессию) и обновить `.env`.
+- [ ] Решить, нужен ли **мониторинг 24/7** (сейчас только в рабочие часы). Для 24/7 надо развязать
+      WebSocket и presence: сокет держать всегда, 🟢/⚪️ регулировать через `setPresence`.
+- [ ] Опционально: персистентный журнал уведомлений (`mentions.jsonl` в volume).
+- [ ] `playwright` сейчас в `dependencies` → попадает в прод-образ; логичнее перенести в
+      `devDependencies` (в контейнере хелпер не запускается).
+- [ ] Безопасность: при ужесточении требований — перелогиниться в браузерном Slack (инвалидирует
+      старую сессию) и обновить `.env`.

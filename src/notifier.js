@@ -1,36 +1,61 @@
 // Доставка уведомлений о новых упоминаниях/DM на произвольный webhook (POST JSON).
-// Если WEBHOOK_URL не задан — событие только логируется (webhook не вызывается).
-import { config } from './config.js';
-import { log } from './logger.js';
+// Если webhookUrl пуст — событие только логируется (webhook не вызывается).
+//
+// Фабрика: webhookUrl, реализация fetch, логгер и параметры ретраев инъектируются.
+import { log as defaultLog } from './logger.js';
 
-export async function notify(payload) {
-  const head = `${payload.kind === 'mention' ? 'Упоминание' : 'Личное сообщение'} от ${payload.from}`;
-  log.info(`🔔 ${head}: ${String(payload.text || '').slice(0, 100)}`);
+export function createNotifier({
+  webhookUrl = '',
+  fetchImpl = fetch,
+  logger = defaultLog,
+  timeoutMs = 5000,
+  retries = 2,
+} = {}) {
+  const LABELS = {
+    mention: 'Упоминание',
+    dm: 'Личное сообщение',
+    group_dm: 'Групповой чат',
+    keyword: 'Ключевое слово',
+  };
 
-  if (!config.webhookUrl) {
-    log.debug('WEBHOOK_URL не задан — уведомление только в лог.');
-    return;
-  }
+  return async function notify(payload) {
+    const label = LABELS[payload.kind] || 'Сообщение';
+    const suffix = payload.kind === 'keyword' && payload.keyword ? ` [${payload.keyword}]` : '';
+    const head = `${label}${suffix} от ${payload.from}`;
+    // channel+ts в INFO — по ним удобно дёргать POST /react/{channel}/{ts}.
+    const chTag = payload.channel ? ` ch=${payload.channel}` : '';
+    const tsTag = payload.ts ? ` ts=${payload.ts}` : '';
+    logger.info(`🔔 ${head}${chTag}${tsTag}: ${String(payload.text || '').slice(0, 100)}`);
 
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    try {
-      const ctrl = new AbortController();
-      const t = setTimeout(() => ctrl.abort(), 5000);
-      const res = await fetch(config.webhookUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-        signal: ctrl.signal,
-      });
-      clearTimeout(t);
-      if (res.ok) {
-        log.debug(`Webhook доставлен (HTTP ${res.status}).`);
-        return;
-      }
-      log.warn(`Webhook вернул HTTP ${res.status} (попытка ${attempt}).`);
-    } catch (e) {
-      log.warn(`Webhook ошибка (попытка ${attempt}): ${e.message}`);
+    if (!webhookUrl) {
+      logger.debug('WEBHOOK_URL не задан — уведомление только в лог.');
+      return false;
     }
-  }
-  log.warn('Webhook не доставлен после 2 попыток.');
+
+    for (let attempt = 1; attempt <= retries; attempt++) {
+      try {
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), timeoutMs);
+        try {
+          const res = await fetchImpl(webhookUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+            signal: ctrl.signal,
+          });
+          if (res.ok) {
+            logger.debug(`Webhook доставлен (HTTP ${res.status}).`);
+            return true;
+          }
+          logger.warn(`Webhook вернул HTTP ${res.status} (попытка ${attempt}).`);
+        } finally {
+          clearTimeout(t);
+        }
+      } catch (e) {
+        logger.warn(`Webhook ошибка (попытка ${attempt}): ${e.message}`);
+      }
+    }
+    logger.warn(`Webhook не доставлен после ${retries} попыток.`);
+    return false;
+  };
 }

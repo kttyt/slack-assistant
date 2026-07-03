@@ -3,9 +3,11 @@ FROM node:20-alpine
 # Запуск под непривилегированным пользователем
 WORKDIR /app
 
-# Сначала зависимости — лучше кэшируется
-COPY package.json ./
-RUN npm install --omit=dev && npm cache clean --force
+# Сначала зависимости — лучше кэшируется. Ставим строго по lock-файлу (воспроизводимо).
+# --omit=optional оставляет прокси-пакеты (undici, https-proxy-agent) ВНЕ образа: они нужны
+# только при включённом HTTP/S-прокси. Нужен прокси в контейнере — соберите без этого флага.
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --omit=optional && npm cache clean --force
 
 # Затем исходники
 COPY src ./src

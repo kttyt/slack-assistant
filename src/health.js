@@ -1,88 +1,117 @@
-// Отслеживает валидность токена и отдаёт состояние по HTTP для Docker HEALTHCHECK.
-// Эндпоинты: GET /health -> 200 (ok) / 503 (token_invalid или ещё не проверено).
-import http from 'node:http';
-import { config } from './config.js';
-import { log } from './logger.js';
+// Состояние здоровья сервиса: валидность токена + состояние WebSocket-соединения.
+// Это ЧИСТОЕ доменное состояние (без HTTP): рендер в ответ /health живёт в
+// src/server/handlers/health.js, а сам сервер — в src/server/index.js.
+// Нездоров, если токен протух ИЛИ мы должны быть онлайн (рабочие часы), но соединение
+// мертво дольше pongTimeoutMs (то есть это не короткий «дышащий» реконнект).
+//
+// Фабрика createHealth(): состояние инкапсулировано в экземпляре, никакого модульного
+// синглтона — можно поднимать независимые копии в тестах. now инъектируется для детерминизма.
+import { log as defaultLog } from './logger.js';
 
-const state = {
-  tokenValid: null, // null = ещё не проверяли, true/false = результат последней проверки
-  lastOkAt: null,
-  lastError: null,
-  user: null,
-  team: null,
-};
+export function createHealth({ pongTimeoutMs, logger = defaultLog, now = () => Date.now() } = {}) {
+  const state = {
+    tokenValid: null, // null = ещё не проверяли, true/false = результат последней проверки
+    lastOkAt: null,
+    lastError: null,
+    user: null,
+    team: null,
+    activeIntended: false, // хотим ли мы сейчас держать соединение (по расписанию)
+    wsConnected: false, // открыт ли WebSocket прямо сейчас
+    lastPongAt: null, // время последнего pong от Slack (ISO)
+    socketDownSince: null, // с какого момента сокет лежит, будучи нужным (мс, epoch)
+  };
 
-let warned = false; // чтобы не спамить лог при каждом провале подряд
+  let warned = false; // чтобы не спамить лог при каждом провале подряд
 
-// Зафиксировать успешную авторизацию.
-export function markValid(info = {}) {
-  state.tokenValid = true;
-  state.lastOkAt = new Date().toISOString();
-  state.lastError = null;
-  if (info.user) state.user = info.user;
-  if (info.team) state.team = info.team;
-  if (warned) {
-    log.info('Токен снова валиден — авторизация восстановлена.');
-    warned = false;
-  }
-}
-
-// Зафиксировать протухание/невалидность токена. Громко предупреждаем один раз.
-export function markInvalid(error) {
-  state.tokenValid = false;
-  state.lastError = error;
-  if (!warned) {
-    warned = true;
-    log.error('========================================================');
-    log.error(`ТОКЕН ПРОТУХ ИЛИ НЕВАЛИДЕН: ${error}`);
-    log.error('Презенс держать не получится. Обновите SLACK_XOXC_TOKEN и');
-    log.error('SLACK_XOXD_COOKIE в .env (см. README) и перезапустите контейнер.');
-    log.error('Контейнер помечен как unhealthy.');
-    log.error('========================================================');
-  }
-}
-
-export function isTokenValid() {
-  return state.tokenValid === true;
-}
-
-// Набор ошибок Slack, означающих, что токен/cookie больше не работают.
-const AUTH_ERRORS = new Set([
-  'invalid_auth',
-  'not_authed',
-  'token_revoked',
-  'token_expired',
-  'account_inactive',
-  'no_permission',
-  'missing_scope',
-]);
-
-export function isAuthError(slackError) {
-  return AUTH_ERRORS.has(String(slackError || '').replace(/^.*:\s*/, ''));
-}
-
-// Поднять HTTP-сервер для healthcheck.
-export function startHealthServer() {
-  const server = http.createServer((req, res) => {
-    if (req.url === '/health') {
-      const ok = state.tokenValid === true;
-      res.writeHead(ok ? 200 : 503, { 'Content-Type': 'application/json' });
-      res.end(
-        JSON.stringify({
-          status: state.tokenValid === null ? 'starting' : ok ? 'ok' : 'token_invalid',
-          tokenValid: state.tokenValid,
-          lastOkAt: state.lastOkAt,
-          lastError: state.lastError,
-          user: state.user,
-          team: state.team,
-        }),
-      );
-      return;
+  function markValid(info = {}) {
+    state.tokenValid = true;
+    state.lastOkAt = new Date().toISOString();
+    state.lastError = null;
+    if (info.user) state.user = info.user;
+    if (info.team) state.team = info.team;
+    if (warned) {
+      logger.info('Токен снова валиден — авторизация восстановлена.');
+      warned = false;
     }
-    res.writeHead(404);
-    res.end();
-  });
-  server.on('error', (e) => log.warn('Health-сервер:', e.message));
-  server.listen(config.healthPort, () => log.info(`Health-сервер на порту ${config.healthPort}.`));
-  return server;
+  }
+
+  function markInvalid(error) {
+    state.tokenValid = false;
+    state.lastError = error;
+    if (!warned) {
+      warned = true;
+      logger.error('========================================================');
+      logger.error(`ТОКЕН ПРОТУХ ИЛИ НЕВАЛИДЕН: ${error}`);
+      logger.error('Презенс держать не получится. Обновите SLACK_XOXC_TOKEN и');
+      logger.error('SLACK_XOXD_COOKIE в .env (см. README) и перезапустите контейнер.');
+      logger.error('Контейнер помечен как unhealthy.');
+      logger.error('========================================================');
+    }
+  }
+
+  // Планировщик сообщает, должны ли мы сейчас быть онлайн. Вне рабочих часов «лежащий»
+  // сокет — это норма, поэтому сбрасываем счётчик простоя.
+  function markActiveIntended(intended) {
+    state.activeIntended = intended;
+    if (!intended) state.socketDownSince = null;
+  }
+
+  function markSocketConnected() {
+    state.wsConnected = true;
+    state.socketDownSince = null;
+  }
+
+  // Отсчёт простоя начинаем только когда мы хотели быть онлайн.
+  function markSocketDisconnected() {
+    state.wsConnected = false;
+    if (state.activeIntended && state.socketDownSince === null) {
+      state.socketDownSince = now();
+    }
+  }
+
+  function markPong() {
+    state.lastPongAt = new Date().toISOString();
+  }
+
+  // Соединение мертво «слишком долго»: нужно быть онлайн, но сокета нет дольше pongTimeoutMs.
+  function socketDegraded() {
+    if (!state.activeIntended || state.wsConnected) return false;
+    if (state.socketDownSince === null) return false;
+    return now() - state.socketDownSince > pongTimeoutMs;
+  }
+
+  // Снимок для HTTP-ответа + вычисленные ok/status.
+  function snapshot() {
+    const degraded = socketDegraded();
+    const ok = state.tokenValid === true && !degraded;
+    let status;
+    if (state.tokenValid === null) status = 'starting';
+    else if (state.tokenValid !== true) status = 'token_invalid';
+    else if (degraded) status = 'socket_down';
+    else status = 'ok';
+    return {
+      ok,
+      status,
+      tokenValid: state.tokenValid,
+      lastOkAt: state.lastOkAt,
+      lastError: state.lastError,
+      user: state.user,
+      team: state.team,
+      activeIntended: state.activeIntended,
+      wsConnected: state.wsConnected,
+      lastPongAt: state.lastPongAt,
+    };
+  }
+
+  return {
+    markValid,
+    markInvalid,
+    markActiveIntended,
+    markSocketConnected,
+    markSocketDisconnected,
+    markPong,
+    isTokenValid: () => state.tokenValid === true,
+    socketDegraded,
+    snapshot,
+  };
 }
