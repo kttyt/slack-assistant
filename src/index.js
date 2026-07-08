@@ -76,6 +76,7 @@ async function main() {
     wsAgent: proxy.wsAgent,
     timings: {
       pingIntervalMs: config.pingIntervalMs,
+      tickleIntervalMs: config.tickleIntervalMs,
       pongTimeoutMs: config.pongTimeoutMs,
       presenceRefreshMs: config.presenceRefreshMs,
     },

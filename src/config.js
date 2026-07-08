@@ -114,6 +114,7 @@ const SCHEMA = [
   { key: 'offHoursMode', path: 'presence.offHoursMode', env: 'OFF_HOURS_MODE', type: 'enum', def: 'release', values: ['away', 'release'] },
   { key: 'clearDnd', path: 'presence.clearDnd', env: 'CLEAR_DND', type: 'bool', def: false },
   { key: 'pingIntervalMs', path: 'presence.pingIntervalMs', env: 'PING_INTERVAL_MS', type: 'int', def: 20000, min: 1000 },
+  { key: 'tickleIntervalMs', path: 'presence.tickleIntervalMs', env: 'TICKLE_INTERVAL_MS', type: 'int', def: 180000, min: 10000 },
   { key: 'pongTimeoutMs', path: 'presence.pongTimeoutMs', env: 'PONG_TIMEOUT_MS', type: 'int', def: 60000, min: 5000 },
   { key: 'presenceRefreshMs', path: 'presence.presenceRefreshMs', env: 'PRESENCE_REFRESH_MS', type: 'int', def: 120000, min: 10000 },
   { key: 'webhookUrl', path: 'notifications.webhookUrl', env: 'WEBHOOK_URL', type: 'str', def: '', validate: httpUrl },

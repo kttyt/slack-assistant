@@ -1,5 +1,8 @@
 // Менеджер WebSocket-соединения с Slack RTM.
-// Пока соединение открыто и мы шлём периодические ping — Slack считает нас активным клиентом (зелёный шарик).
+// Зелёный статус держит НЕ ping/pong (это лишь транспортный keep-alive) и НЕ setPresence('auto'),
+// а периодический прикладной кадр активности {"type":"tickle"} — только он сбрасывает away-таймер
+// presence-сервера Slack (Flannel), который иначе через ~10 минут переводит аккаунт в away.
+// Реальный presence проверяем через users.getPresence и отражаем в health (без «ложно-зелёного»).
 //
 // Все зависимости инъектируются через конструктор: slack-клиент, notify, health-экземпляр,
 // логгер, тайминги, поведение, реализация WebSocket и (опционально) прокси-agent для ws.
@@ -32,6 +35,7 @@ export class PresenceKeeper {
 
     // Тайминги (в проде приходят из config; в тестах — крошечные).
     this.pingIntervalMs = timings.pingIntervalMs ?? 20000;
+    this.tickleIntervalMs = timings.tickleIntervalMs ?? 180000; // кадр активности (< 10-мин окна away)
     this.pongTimeoutMs = timings.pongTimeoutMs ?? 60000;
     this.presenceRefreshMs = timings.presenceRefreshMs ?? 120000;
     this.backoffStartMs = timings.backoffStartMs ?? 1000;
@@ -51,6 +55,7 @@ export class PresenceKeeper {
 
     this.ws = null;
     this.pingTimer = null;
+    this.tickleTimer = null;
     this.presenceTimer = null;
     this.reconnectTimer = null;
     this.msgId = 1;
@@ -165,7 +170,12 @@ export class PresenceKeeper {
 
     // Периодический heartbeat: шлём ping и следим, что на него отвечают pong.
     this.pingTimer = setInterval(() => this.heartbeat(), this.pingIntervalMs);
-    this.log.debug(`Таймеры запущены: ping=${this.pingIntervalMs}мс, presence=${this.presenceRefreshMs}мс.`);
+
+    // Кадр активности: именно tickle (а не ping/setPresence) держит нас active в глазах Flannel.
+    // Шлём сразу при подключении и затем периодически, с запасом внутри 10-минутного окна away.
+    this.sendTickle();
+    this.tickleTimer = setInterval(() => this.sendTickle(), this.tickleIntervalMs);
+    this.log.debug(`Таймеры запущены: ping=${this.pingIntervalMs}мс, tickle=${this.tickleIntervalMs}мс, presence=${this.presenceRefreshMs}мс.`);
   }
 
   onMessage(raw) {
@@ -214,11 +224,36 @@ export class PresenceKeeper {
     if (!hit) return this.log.debug('  -> отфильтровано (не подходит под условия уведомления).');
 
     const from = await this.slack.userName(m.user);
-    const permalink = this.teamUrl
-      ? `${this.teamUrl.replace(/\/$/, '')}/archives/${ch}/p${String(m.ts || '').replace('.', '')}`
-      : undefined;
 
-    this.log.debug(`  -> уведомление kind=${hit.kind} from=${from}${hit.keyword ? ` keyword=${hit.keyword}` : ''}`);
+    // Ответ в треде: m.thread_ts указывает на корень. У самого корневого сообщения
+    // thread_ts либо отсутствует, либо равен ts — такое за «ответ в треде» не считаем.
+    const threadTs = m.thread_ts && m.thread_ts !== m.ts ? m.thread_ts : null;
+
+    let permalink;
+    if (this.teamUrl) {
+      const link = `${this.teamUrl.replace(/\/$/, '')}/archives/${ch}/p${String(m.ts || '').replace('.', '')}`;
+      // Для ответа в треде добавляем thread_ts+cid, чтобы ссылка вела прямо в тред.
+      permalink = threadTs ? `${link}?thread_ts=${threadTs}&cid=${ch}` : link;
+    }
+
+    // «Шапка» треда: текст и автор корневого сообщения (тянем только для ответов в треде).
+    let threadRootText;
+    let threadRootFrom;
+    if (threadTs) {
+      try {
+        const root = await this.slack.threadRoot(ch, threadTs);
+        if (root) {
+          threadRootText = root.text;
+          threadRootFrom = root.user ? await this.slack.userName(root.user) : undefined;
+        }
+      } catch (e) {
+        this.log.debug(`threadRoot(${ch}, ${threadTs}) не удалось: ${e.message}`);
+      }
+    }
+
+    this.log.debug(
+      `  -> уведомление kind=${hit.kind} from=${from}${hit.keyword ? ` keyword=${hit.keyword}` : ''}${threadTs ? ' (ответ в треде)' : ''}`,
+    );
     await this.notify({
       kind: hit.kind,
       from,
@@ -227,6 +262,9 @@ export class PresenceKeeper {
       channel_type: hit.channelType,
       text: m.text,
       ts: m.ts,
+      thread_ts: threadTs || undefined,
+      thread_root_text: threadRootText,
+      thread_root_from: threadRootFrom,
       keyword: hit.keyword,
       permalink,
     });
@@ -262,6 +300,18 @@ export class PresenceKeeper {
     }
   }
 
+  // Кадр активности для presence-сервера Slack. id — последовательный (как у ping).
+  sendTickle() {
+    if (this.ws && this.ws.readyState === this.WS.OPEN) {
+      try {
+        this.ws.send(JSON.stringify({ id: this.msgId++, type: 'tickle' }));
+        this.log.debug('tickle отправлен (сигнал активности).');
+      } catch (e) {
+        this.log.warn('tickle не отправлен:', e.message);
+      }
+    }
+  }
+
   async refreshPresence() {
     try {
       await this.slack.setPresence('auto');
@@ -270,14 +320,35 @@ export class PresenceKeeper {
       this.log.warn('setPresence(auto) не удался:', e.message);
       if (isAuthError(e.message)) this.health.markInvalid(e.message);
     }
+
+    // Верификация: спрашиваем Slack, какой у нас РЕАЛЬНЫЙ presence. Делает health честным
+    // и сразу показывает, работает ли tickle (иначе увидим 'away' при живом соединении).
+    if (this.myUserId && this.slack.getPresence) {
+      try {
+        const p = await this.slack.getPresence(this.myUserId);
+        this.health.markPresence(p.presence);
+        if (p.presence === 'away') {
+          this.log.warn('Slack видит нас AWAY при живом соединении — presence не держится (tickle не сработал?).');
+        } else {
+          this.log.debug(`Реальный presence: ${p.presence}.`);
+        }
+      } catch (e) {
+        this.log.debug('users.getPresence не удался:', e.message);
+      }
+    }
+
     if (this.clearDnd) {
       try {
         const info = await this.slack.dndInfo();
         if (info.snooze_enabled) {
           await this.slack.endSnooze();
-          this.log.info('Снял режим «Не беспокоить» (убрал Zzz).');
+          this.log.info('Снял ручной снуз «Не беспокоить» (убрал Zzz).');
+        } else if (info.dnd_enabled && this.slack.endDnd) {
+          // Scheduled DND (по расписанию уведомлений): endSnooze его не берёт — завершаем сессию.
+          await this.slack.endDnd();
+          this.log.info('Завершил DND-сессию по расписанию (убрал Zzz).');
         } else {
-          this.log.debug('DND: snooze не активен.');
+          this.log.debug('DND: не активен.');
         }
       } catch (e) {
         this.log.debug('Проверка/снятие DND не удались:', e.message);
@@ -305,14 +376,18 @@ export class PresenceKeeper {
   // Аккуратно гасим таймеры и сокет.
   teardownSocket() {
     if (this.pingTimer) clearInterval(this.pingTimer);
+    if (this.tickleTimer) clearInterval(this.tickleTimer);
     if (this.presenceTimer) clearInterval(this.presenceTimer);
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    this.pingTimer = this.presenceTimer = this.reconnectTimer = null;
+    this.pingTimer = this.tickleTimer = this.presenceTimer = this.reconnectTimer = null;
     if (this.ws) {
       const ws = this.ws;
       this.ws = null;
       try {
         ws.removeAllListeners();
+        // terminate() на ещё-подключающемся сокете асинхронно эмитит 'error'; без обработчика
+        // он всплывает как unhandled. Ставим no-op, чтобы аккуратно его проглотить.
+        ws.on('error', () => {});
         ws.terminate();
       } catch {
         /* игнорируем */

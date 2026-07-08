@@ -19,6 +19,8 @@ export function createHealth({ pongTimeoutMs, logger = defaultLog, now = () => D
     wsConnected: false, // открыт ли WebSocket прямо сейчас
     lastPongAt: null, // время последнего pong от Slack (ISO)
     socketDownSince: null, // с какого момента сокет лежит, будучи нужным (мс, epoch)
+    realPresence: null, // фактический presence по users.getPresence: null=неизвестно | 'active' | 'away'
+    realPresenceAt: null, // когда последний раз проверяли реальный presence (ISO)
   };
 
   let warned = false; // чтобы не спамить лог при каждом провале подряд
@@ -73,6 +75,17 @@ export function createHealth({ pongTimeoutMs, logger = defaultLog, now = () => D
     state.lastPongAt = new Date().toISOString();
   }
 
+  // Фактический presence из users.getPresence — делает /health честным (а не «ложно-зелёным»).
+  function markPresence(presence) {
+    state.realPresence = presence;
+    state.realPresenceAt = new Date().toISOString();
+  }
+
+  // Мы должны быть онлайн, соединение живо, но Slack видит нас 'away' — presence не держится.
+  function presenceLost() {
+    return state.activeIntended && state.realPresence === 'away';
+  }
+
   // Соединение мертво «слишком долго»: нужно быть онлайн, но сокета нет дольше pongTimeoutMs.
   function socketDegraded() {
     if (!state.activeIntended || state.wsConnected) return false;
@@ -83,11 +96,13 @@ export function createHealth({ pongTimeoutMs, logger = defaultLog, now = () => D
   // Снимок для HTTP-ответа + вычисленные ok/status.
   function snapshot() {
     const degraded = socketDegraded();
-    const ok = state.tokenValid === true && !degraded;
+    const lostPresence = presenceLost();
+    const ok = state.tokenValid === true && !degraded && !lostPresence;
     let status;
     if (state.tokenValid === null) status = 'starting';
     else if (state.tokenValid !== true) status = 'token_invalid';
     else if (degraded) status = 'socket_down';
+    else if (lostPresence) status = 'presence_away';
     else status = 'ok';
     return {
       ok,
@@ -100,6 +115,8 @@ export function createHealth({ pongTimeoutMs, logger = defaultLog, now = () => D
       activeIntended: state.activeIntended,
       wsConnected: state.wsConnected,
       lastPongAt: state.lastPongAt,
+      realPresence: state.realPresence,
+      realPresenceAt: state.realPresenceAt,
     };
   }
 
@@ -110,8 +127,10 @@ export function createHealth({ pongTimeoutMs, logger = defaultLog, now = () => D
     markSocketConnected,
     markSocketDisconnected,
     markPong,
+    markPresence,
     isTokenValid: () => state.tokenValid === true,
     socketDegraded,
+    presenceLost,
     snapshot,
   };
 }

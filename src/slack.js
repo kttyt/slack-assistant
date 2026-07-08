@@ -79,18 +79,29 @@ export function createSlackClient({
     // Проверка валидности токена/cookie. Возвращает данные пользователя.
     authTest: () => call('auth.test'),
     // WebSocket-URL реального времени (та же точка входа, что у веб-клиента).
+    // presence_sub:true — подписка на события своего presence (нужна для честной верификации).
     rtmConnect: async () => {
-      const data = await call('rtm.connect', { presence_sub: 'false', batch_presence_aware: '1' });
+      const data = await call('rtm.connect', { presence_sub: 'true', batch_presence_aware: '1' });
       return data.url;
     },
     // Режим присутствия: 'auto' (Slack решает по активности) или 'away'.
     setPresence: (presence) => call('users.setPresence', { presence }),
+    // Реальный presence пользователя ('active'/'away'). Для собственного id отдаёт и last_activity.
+    getPresence: (user) => call('users.getPresence', { user }),
     // Состояние "Не беспокоить" (snooze/dnd).
     dndInfo: () => call('dnd.info'),
     // Снять ручной снуз ("Не беспокоить"), чтобы убрать значок Zzz.
     endSnooze: () => call('dnd.endSnooze'),
+    // Завершить текущую DND-сессию (в т.ч. по расписанию) — снимает scheduled Zzz.
+    endDnd: () => call('dnd.endDnd'),
     // Поставить реакцию на сообщение. name — эмодзи БЕЗ двоеточий (напр. "eyes").
     reactionsAdd: (channel, timestamp, name) => call('reactions.add', { channel, timestamp, name }),
+    // Корневое сообщение треда (для «шапки» уведомления об ответе в треде).
+    // conversations.replies отдаёт сообщения от корня; с limit=1+inclusive это ровно родитель.
+    threadRoot: async (channel, ts) => {
+      const d = await call('conversations.replies', { channel, ts, limit: '1', inclusive: 'true' });
+      return d.messages?.[0] || null;
+    },
     userName,
     // Заголовки для WebSocket-рукопожатия: cookie "d" + тот же User-Agent, что и у Web API.
     wsHeaders: () => ({ Cookie: `d=${xoxd}`, 'User-Agent': userAgent }),

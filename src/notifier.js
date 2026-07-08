@@ -21,11 +21,19 @@ export function createNotifier({
   return async function notify(payload) {
     const label = LABELS[payload.kind] || 'Сообщение';
     const suffix = payload.kind === 'keyword' && payload.keyword ? ` [${payload.keyword}]` : '';
-    const head = `${label}${suffix} от ${payload.from}`;
+    const inThread = payload.thread_ts ? ' в треде' : '';
+    const head = `${label}${suffix}${inThread} от ${payload.from}`;
     // channel+ts в INFO — по ним удобно дёргать POST /react/{channel}/{ts}.
     const chTag = payload.channel ? ` ch=${payload.channel}` : '';
     const tsTag = payload.ts ? ` ts=${payload.ts}` : '';
-    logger.info(`🔔 ${head}${chTag}${tsTag}: ${String(payload.text || '').slice(0, 100)}`);
+    // «Шапка» треда: корневое сообщение (автор + начало текста), если удалось подтянуть.
+    let threadTag = '';
+    if (payload.thread_ts && payload.thread_root_text) {
+      const root = String(payload.thread_root_text).replace(/\s+/g, ' ').slice(0, 60);
+      const rootFrom = payload.thread_root_from ? `${payload.thread_root_from}: ` : '';
+      threadTag = ` | тред «${rootFrom}${root}»`;
+    }
+    logger.info(`🔔 ${head}${chTag}${tsTag}${threadTag}: ${String(payload.text || '').slice(0, 100)}`);
 
     if (!webhookUrl) {
       logger.debug('WEBHOOK_URL не задан — уведомление только в лог.');
