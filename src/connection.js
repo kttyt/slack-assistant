@@ -12,6 +12,14 @@ import { log as defaultLog } from './logger.js';
 import { isAuthError } from './slack.js';
 import { classifyMessage } from './detect.js';
 
+// Человекочитаемое описание состояния DND для логов.
+function describeDnd(d) {
+  const parts = [`расписание=${d.dnd_enabled ? 'вкл' : 'выкл'}`, `снуз=${d.snooze_enabled ? 'вкл' : 'выкл'}`];
+  if (d.snooze_enabled && d.snooze_endtime) parts.push(`снуз до ${new Date(d.snooze_endtime * 1000).toISOString()}`);
+  if (d.dnd_enabled && d.next_dnd_end_ts) parts.push(`окно до ${new Date(d.next_dnd_end_ts * 1000).toISOString()}`);
+  return parts.join(', ');
+}
+
 export class PresenceKeeper {
   constructor({
     slack,
@@ -66,6 +74,8 @@ export class PresenceKeeper {
     this.teamUrl = identity.teamUrl ?? null; // https://<team>.slack.com/ — для ссылок
     this.lastPongAt = 0; // время последнего pong, мс (для детекта мёртвого соединения)
     this.offHoursApplied = false; // выставили ли уже presence вне рабочих часов
+    this.dndState = null; // последний снимок состояния DND (для детекта изменений)
+    this.dndKey = null; // сериализованный снимок DND (быстрое сравнение)
   }
 
   // Сообщить, от чьего имени работаем (берётся из auth.test).
@@ -338,24 +348,54 @@ export class PresenceKeeper {
       }
     }
 
-    if (this.clearDnd || this.clearScheduledDnd) {
-      try {
-        const info = await this.slack.dndInfo();
-        if (this.clearDnd && info.snooze_enabled) {
-          // Ручной снуз ("Pause notifications на N минут/до завтра").
-          await this.slack.endSnooze();
-          this.log.info('Снял ручной снуз «Не беспокоить» (убрал Zzz).');
-        } else if (this.clearScheduledDnd && info.dnd_enabled && this.slack.endDnd) {
-          // DND по расписанию (Notification schedule): endSnooze его не берёт — завершаем сессию.
-          await this.slack.endDnd();
-          this.log.info('Завершил DND-сессию по расписанию (убрал Zzz).');
-        } else {
-          this.log.debug('DND: снимать нечего (не активен или опция выключена).');
-        }
-      } catch (e) {
-        this.log.debug('Проверка/снятие DND не удались:', e.message);
+    // Состояние DND читаем ВСЕГДА (для наблюдаемости), логируем изменения, сохраняем в health.
+    // Снятие (endSnooze/endDnd) — только по включённым опциям.
+    try {
+      const info = await this.slack.dndInfo();
+      this.trackDnd(info);
+
+      if (this.clearDnd && info.snooze_enabled) {
+        // Ручной снуз ("Pause notifications на N минут/до завтра").
+        await this.slack.endSnooze();
+        this.log.info('Снял ручной снуз «Не беспокоить» (убрал Zzz).');
+        this.applyDndCleared({ snooze_enabled: false, snooze_endtime: 0 });
+      } else if (this.clearScheduledDnd && info.dnd_enabled && this.slack.endDnd) {
+        // DND по расписанию (Notification schedule): endSnooze его не берёт — завершаем сессию.
+        await this.slack.endDnd();
+        this.log.info('Завершил DND-сессию по расписанию (убрал Zzz).');
+        this.applyDndCleared({ dnd_enabled: false });
       }
+    } catch (e) {
+      this.log.debug('Проверка/снятие DND не удались:', e.message);
     }
+  }
+
+  // Снимок значимых полей DND; логируем при любом изменении, сохраняем в health.
+  trackDnd(info) {
+    const snap = {
+      dnd_enabled: !!info.dnd_enabled,
+      snooze_enabled: !!info.snooze_enabled,
+      snooze_endtime: info.snooze_endtime || 0,
+      next_dnd_start_ts: info.next_dnd_start_ts || 0,
+      next_dnd_end_ts: info.next_dnd_end_ts || 0,
+    };
+    const key = JSON.stringify(snap);
+    if (this.dndKey === null) {
+      this.log.info(`DND исходное состояние: ${describeDnd(snap)}.`);
+    } else if (key !== this.dndKey) {
+      this.log.info(`DND изменился: ${describeDnd(this.dndState)} → ${describeDnd(snap)}.`);
+    }
+    this.dndState = snap;
+    this.dndKey = key;
+    this.health.markDnd(snap);
+  }
+
+  // Отразить в сохранённом состоянии наше собственное снятие DND, чтобы на следующем цикле
+  // оно не залогировалось повторно как «изменение» (мы его уже отдельно залогировали).
+  applyDndCleared(patch) {
+    this.dndState = { ...this.dndState, ...patch };
+    this.dndKey = JSON.stringify(this.dndState);
+    this.health.markDnd(this.dndState);
   }
 
   scheduleReconnect() {

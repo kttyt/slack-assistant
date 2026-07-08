@@ -21,6 +21,8 @@ export function createHealth({ pongTimeoutMs, logger = defaultLog, now = () => D
     socketDownSince: null, // с какого момента сокет лежит, будучи нужным (мс, epoch)
     realPresence: null, // фактический presence по users.getPresence: null=неизвестно | 'active' | 'away'
     realPresenceAt: null, // когда последний раз проверяли реальный presence (ISO)
+    dnd: null, // последнее известное состояние DND (снимок значимых полей dnd.info)
+    dndAt: null, // когда обновляли состояние DND (ISO)
   };
 
   let warned = false; // чтобы не спамить лог при каждом провале подряд
@@ -81,6 +83,12 @@ export function createHealth({ pongTimeoutMs, logger = defaultLog, now = () => D
     state.realPresenceAt = new Date().toISOString();
   }
 
+  // Текущее состояние DND (снимок значимых полей) — для наблюдаемости через /health.
+  function markDnd(dnd) {
+    state.dnd = dnd;
+    state.dndAt = new Date().toISOString();
+  }
+
   // Мы должны быть онлайн, соединение живо, но Slack видит нас 'away' — presence не держится.
   function presenceLost() {
     return state.activeIntended && state.realPresence === 'away';
@@ -117,6 +125,8 @@ export function createHealth({ pongTimeoutMs, logger = defaultLog, now = () => D
       lastPongAt: state.lastPongAt,
       realPresence: state.realPresence,
       realPresenceAt: state.realPresenceAt,
+      dnd: state.dnd,
+      dndAt: state.dndAt,
     };
   }
 
@@ -128,6 +138,7 @@ export function createHealth({ pongTimeoutMs, logger = defaultLog, now = () => D
     markSocketDisconnected,
     markPong,
     markPresence,
+    markDnd,
     isTokenValid: () => state.tokenValid === true,
     socketDegraded,
     presenceLost,
