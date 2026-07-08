@@ -83,6 +83,7 @@ async function main() {
     behavior: {
       offHoursMode: config.offHoursMode,
       clearDnd: config.clearDnd,
+      clearScheduledDnd: config.clearScheduledDnd,
       notifyMentions: config.notifyMentions,
       mentionChannelWide: config.mentionChannelWide,
       notifyDM: config.notifyDM,

@@ -43,7 +43,8 @@ export class PresenceKeeper {
 
     // Поведение: присутствие.
     this.offHoursMode = behavior.offHoursMode ?? 'release';
-    this.clearDnd = behavior.clearDnd ?? false;
+    this.clearDnd = behavior.clearDnd ?? false; // снимать ручной снуз ("Pause notifications")
+    this.clearScheduledDnd = behavior.clearScheduledDnd ?? false; // снимать DND по расписанию (opt-in)
     // Поведение: детект входящих (что считать поводом для уведомления).
     this.notifyMentions = behavior.notifyMentions ?? true;
     this.mentionChannelWide = behavior.mentionChannelWide ?? false; // @here/@channel/@everyone
@@ -337,18 +338,19 @@ export class PresenceKeeper {
       }
     }
 
-    if (this.clearDnd) {
+    if (this.clearDnd || this.clearScheduledDnd) {
       try {
         const info = await this.slack.dndInfo();
-        if (info.snooze_enabled) {
+        if (this.clearDnd && info.snooze_enabled) {
+          // Ручной снуз ("Pause notifications на N минут/до завтра").
           await this.slack.endSnooze();
           this.log.info('Снял ручной снуз «Не беспокоить» (убрал Zzz).');
-        } else if (info.dnd_enabled && this.slack.endDnd) {
-          // Scheduled DND (по расписанию уведомлений): endSnooze его не берёт — завершаем сессию.
+        } else if (this.clearScheduledDnd && info.dnd_enabled && this.slack.endDnd) {
+          // DND по расписанию (Notification schedule): endSnooze его не берёт — завершаем сессию.
           await this.slack.endDnd();
           this.log.info('Завершил DND-сессию по расписанию (убрал Zzz).');
         } else {
-          this.log.debug('DND: не активен.');
+          this.log.debug('DND: снимать нечего (не активен или опция выключена).');
         }
       } catch (e) {
         this.log.debug('Проверка/снятие DND не удались:', e.message);

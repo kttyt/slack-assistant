@@ -113,6 +113,7 @@ const SCHEMA = [
   { key: 'jitterMax', path: 'schedule.jitter.maxMinutes', env: 'JITTER_MAX_MINUTES', type: 'number', def: 15, min: 0 },
   { key: 'offHoursMode', path: 'presence.offHoursMode', env: 'OFF_HOURS_MODE', type: 'enum', def: 'release', values: ['away', 'release'] },
   { key: 'clearDnd', path: 'presence.clearDnd', env: 'CLEAR_DND', type: 'bool', def: false },
+  { key: 'clearScheduledDnd', path: 'presence.clearScheduledDnd', env: 'CLEAR_SCHEDULED_DND', type: 'bool', def: false },
   { key: 'pingIntervalMs', path: 'presence.pingIntervalMs', env: 'PING_INTERVAL_MS', type: 'int', def: 20000, min: 1000 },
   { key: 'tickleIntervalMs', path: 'presence.tickleIntervalMs', env: 'TICKLE_INTERVAL_MS', type: 'int', def: 180000, min: 10000 },
   { key: 'pongTimeoutMs', path: 'presence.pongTimeoutMs', env: 'PONG_TIMEOUT_MS', type: 'int', def: 60000, min: 5000 },
