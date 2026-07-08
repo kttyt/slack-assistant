@@ -363,7 +363,7 @@ export class PresenceKeeper {
         // DND по расписанию (Notification schedule): endSnooze его не берёт — завершаем сессию.
         await this.slack.endDnd();
         this.log.info('Завершил DND-сессию по расписанию (убрал Zzz).');
-        this.applyDndCleared({ dnd_enabled: false });
+        this.applyDndCleared({ dnd_enabled: false, next_dnd_end_ts: 0 });
       }
     } catch (e) {
       this.log.debug('Проверка/снятие DND не удались:', e.message);
@@ -375,9 +375,11 @@ export class PresenceKeeper {
     const snap = {
       dnd_enabled: !!info.dnd_enabled,
       snooze_enabled: !!info.snooze_enabled,
-      snooze_endtime: info.snooze_endtime || 0,
-      next_dnd_start_ts: info.next_dnd_start_ts || 0,
-      next_dnd_end_ts: info.next_dnd_end_ts || 0,
+      // Времена держим в ключе ТОЛЬКО когда соответствующий режим включён (мы их и логируем
+      // лишь тогда). Иначе они «дышат» (следующее окно/день) и триггерили бы ложные «изменения»
+      // без видимой разницы в логе. next_dnd_start_ts не храним вовсе — он нигде не отображается.
+      snooze_endtime: info.snooze_enabled ? info.snooze_endtime || 0 : 0,
+      next_dnd_end_ts: info.dnd_enabled ? info.next_dnd_end_ts || 0 : 0,
     };
     const key = JSON.stringify(snap);
     if (this.dndKey === null) {
