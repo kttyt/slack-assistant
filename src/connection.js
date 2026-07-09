@@ -12,11 +12,13 @@ import { log as defaultLog } from './logger.js';
 import { isAuthError } from './slack.js';
 import { classifyMessage } from './detect.js';
 
-// Человекочитаемое описание состояния DND для логов.
+// Человекочитаемое описание состояния DND для логов. active — реально ли «Не беспокоить»
+// прямо сейчас (снуз или время внутри окна расписания), а не просто факт наличия расписания.
 function describeDnd(d) {
-  const parts = [`расписание=${d.dnd_enabled ? 'вкл' : 'выкл'}`, `снуз=${d.snooze_enabled ? 'вкл' : 'выкл'}`];
-  if (d.snooze_enabled && d.snooze_endtime) parts.push(`снуз до ${new Date(d.snooze_endtime * 1000).toISOString()}`);
-  if (d.dnd_enabled && d.next_dnd_end_ts) parts.push(`окно до ${new Date(d.next_dnd_end_ts * 1000).toISOString()}`);
+  const parts = [`активен=${d.active ? 'да' : 'нет'}`];
+  if (d.snooze) parts.push(`ручной снуз${d.snooze_endtime ? ` до ${new Date(d.snooze_endtime * 1000).toISOString()}` : ''}`);
+  if (d.scheduledActive) parts.push(`по расписанию до ${new Date((d.windowEnd || 0) * 1000).toISOString()}`);
+  if (!d.active && d.scheduleConfigured) parts.push('расписание настроено (сейчас вне окна)');
   return parts.join(', ');
 }
 
@@ -352,34 +354,38 @@ export class PresenceKeeper {
     // Снятие (endSnooze/endDnd) — только по включённым опциям.
     try {
       const info = await this.slack.dndInfo();
-      this.trackDnd(info);
+      const dnd = this.trackDnd(info);
 
-      if (this.clearDnd && info.snooze_enabled) {
+      if (this.clearDnd && dnd.snooze) {
         // Ручной снуз ("Pause notifications на N минут/до завтра").
         await this.slack.endSnooze();
         this.log.info('Снял ручной снуз «Не беспокоить» (убрал Zzz).');
-        this.applyDndCleared({ snooze_enabled: false, snooze_endtime: 0 });
-      } else if (this.clearScheduledDnd && info.dnd_enabled && this.slack.endDnd) {
-        // DND по расписанию (Notification schedule): endSnooze его не берёт — завершаем сессию.
+        this.applyDndCleared({ snooze: false, snooze_endtime: 0 });
+      } else if (this.clearScheduledDnd && dnd.scheduledActive && this.slack.endDnd) {
+        // DND по расписанию активен ПРЯМО СЕЙЧАС: endSnooze его не берёт — завершаем сессию.
         await this.slack.endDnd();
         this.log.info('Завершил DND-сессию по расписанию (убрал Zzz).');
-        this.applyDndCleared({ dnd_enabled: false, next_dnd_end_ts: 0 });
+        this.applyDndCleared({ scheduledActive: false, windowEnd: 0 });
       }
     } catch (e) {
       this.log.debug('Проверка/снятие DND не удались:', e.message);
     }
   }
 
-  // Снимок значимых полей DND; логируем при любом изменении, сохраняем в health.
+  // Снимок состояния DND; логируем при любом изменении, сохраняем в health. Возвращает snap.
+  // Ключевое: dnd_enabled из API = «расписание настроено», а не «активно сейчас». Реальную
+  // активность (виден ли коллегам Zzz) вычисляем: снуз ИЛИ текущее время внутри окна расписания.
   trackDnd(info) {
+    const now = Math.floor(this.now() / 1000);
+    const scheduledActive =
+      !!info.dnd_enabled && !!info.next_dnd_start_ts && !!info.next_dnd_end_ts && now >= info.next_dnd_start_ts && now < info.next_dnd_end_ts;
     const snap = {
-      dnd_enabled: !!info.dnd_enabled,
-      snooze_enabled: !!info.snooze_enabled,
-      // Времена держим в ключе ТОЛЬКО когда соответствующий режим включён (мы их и логируем
-      // лишь тогда). Иначе они «дышат» (следующее окно/день) и триггерили бы ложные «изменения»
-      // без видимой разницы в логе. next_dnd_start_ts не храним вовсе — он нигде не отображается.
+      active: !!info.snooze_enabled || scheduledActive, // реально ли «Не беспокоить» сейчас (Zzz)
+      snooze: !!info.snooze_enabled, // ручной снуз активен
+      scheduledActive, // активен по расписанию прямо сейчас
+      scheduleConfigured: !!info.dnd_enabled, // расписание в принципе настроено
       snooze_endtime: info.snooze_enabled ? info.snooze_endtime || 0 : 0,
-      next_dnd_end_ts: info.dnd_enabled ? info.next_dnd_end_ts || 0 : 0,
+      windowEnd: scheduledActive ? info.next_dnd_end_ts || 0 : 0,
     };
     const key = JSON.stringify(snap);
     if (this.dndKey === null) {
@@ -390,14 +396,17 @@ export class PresenceKeeper {
     this.dndState = snap;
     this.dndKey = key;
     this.health.markDnd(snap);
+    return snap;
   }
 
   // Отразить в сохранённом состоянии наше собственное снятие DND, чтобы на следующем цикле
   // оно не залогировалось повторно как «изменение» (мы его уже отдельно залогировали).
   applyDndCleared(patch) {
-    this.dndState = { ...this.dndState, ...patch };
-    this.dndKey = JSON.stringify(this.dndState);
-    this.health.markDnd(this.dndState);
+    const s = { ...this.dndState, ...patch };
+    s.active = s.snooze || s.scheduledActive; // пересчитываем итоговую активность
+    this.dndState = s;
+    this.dndKey = JSON.stringify(s);
+    this.health.markDnd(s);
   }
 
   scheduleReconnect() {
