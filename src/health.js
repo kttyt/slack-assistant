@@ -57,7 +57,14 @@ export function createHealth({ pongTimeoutMs, logger = defaultLog, now = () => D
   // сокет — это норма, поэтому сбрасываем счётчик простоя.
   function markActiveIntended(intended) {
     state.activeIntended = intended;
-    if (!intended) state.socketDownSince = null;
+    if (!intended) {
+      state.socketDownSince = null;
+      // Presence опрашивается только при живом соединении; вне расписания последнее
+      // значение мгновенно устаревает — сбрасываем в «неизвестно», чтобы /health не
+      // показывал застывший 'active' после выхода из рабочего окна.
+      state.realPresence = null;
+      state.realPresenceAt = null;
+    }
   }
 
   function markSocketConnected() {

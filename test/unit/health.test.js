@@ -142,3 +142,41 @@ describe('createHealth — деградация соединения', () => {
     expect(health.snapshot().lastPongAt).not.toBe(null);
   });
 });
+
+describe('createHealth — реальный presence', () => {
+  /**
+   * Что: Slack видит нас away, хотя мы должны быть онлайн.
+   * Вход: токен валиден, activeIntended=true, markPresence('away').
+   * Поведение: presence не держится — контейнер нездоров.
+   * Ожидаем: ok=false, status='presence_away'.
+   */
+  test('away при activeIntended -> presence_away и не ok', () => {
+    const { health } = makeHealth();
+    health.markValid();
+    health.markActiveIntended(true);
+    health.markPresence('away');
+    const s = health.snapshot();
+    expect(s.ok).toBe(false);
+    expect(s.status).toBe('presence_away');
+  });
+
+  /**
+   * Что: сброс realPresence при выходе из расписания.
+   * Вход: markPresence('active'), затем markActiveIntended(false).
+   * Поведение: вне окна presence не опрашивается, последнее значение устарело —
+   *            в снимке показываем «неизвестно», а не застывший 'active'.
+   * Ожидаем: realPresence=null, realPresenceAt=null, ok=true.
+   */
+  test('выход из расписания сбрасывает realPresence в неизвестно', () => {
+    const { health } = makeHealth();
+    health.markValid();
+    health.markActiveIntended(true);
+    health.markPresence('active');
+    expect(health.snapshot().realPresence).toBe('active');
+    health.markActiveIntended(false);
+    const s = health.snapshot();
+    expect(s.realPresence).toBe(null);
+    expect(s.realPresenceAt).toBe(null);
+    expect(s.ok).toBe(true);
+  });
+});
